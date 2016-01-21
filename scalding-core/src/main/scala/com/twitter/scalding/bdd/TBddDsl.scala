@@ -4,6 +4,7 @@ import cascading.flow.FlowDef
 import com.twitter.scalding._
 import com.twitter.scalding.source.TypedText
 import scala.collection.mutable.Buffer
+import scala.reflect.ClassTag
 import TDsl._
 
 trait TBddDsl extends FieldConversions with TypedPipeOperationsConversions {
@@ -18,7 +19,7 @@ trait TBddDsl extends FieldConversions with TypedPipeOperationsConversions {
     def asSource: Source =
       IterableSource(data map { Tuple1(_) }, 'tuple)
 
-    def readFromSourceAsTyped(implicit flowDef: FlowDef, mode: Mode): TypedPipe[T] =
+    def readFromSourceAsTyped(implicit flowDef: FlowDef, mode: Mode, mfT: ClassTag[T]): TypedPipe[T] =
       asSource.read.toTypedPipe[Tuple1[T]]('tuple) map { _._1 }
 
     def addSourceDataToJobTest(jobTest: JobTest) = jobTest.source(asSource, data)

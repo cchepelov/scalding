@@ -39,6 +39,7 @@ import java.util.Comparator
 import scala.collection.JavaConverters._
 import scala.util.Try
 import scala.collection.immutable.Queue
+import scala.reflect.ClassTag
 
 import Dsl._
 
@@ -87,10 +88,10 @@ object Grouped {
   val valueField: Fields = new Fields("value")
   val kvFields: Fields = new Fields("key", "value")
 
-  def apply[K, V](pipe: TypedPipe[(K, V)])(implicit ordering: Ordering[K]): Grouped[K, V] =
+  def apply[K, V](pipe: TypedPipe[(K, V)])(implicit ordering: Ordering[K], mfK: ClassTag[K], mfV: ClassTag[V]): Grouped[K, V] =
     IdentityReduce(ordering, pipe, None, Nil)
 
-  def valueSorting[V](ord: Ordering[V]): Fields = Field.singleOrdered[V]("value")(ord)
+  def valueSorting[V](ord: Ordering[V], mf: ClassTag[V]): Fields = Field.singleOrdered[V]("value")(ord, mf)
 
   /**
    * If we are using OrderedComparable, we need to box the key
@@ -111,18 +112,18 @@ object Grouped {
     (boxfn, boxordSer)
   }
 
-  private[scalding] def maybeBox[K, V](ord: Ordering[K], flowDef: FlowDef)(op: (TupleSetter[(K, V)], Fields) => Pipe): Pipe =
+  private[scalding] def maybeBox[K, V](ord: Ordering[K], flowDef: FlowDef)(op: (TupleSetter[(K, V)], Fields) => Pipe)(implicit mf: ClassTag[K]): Pipe =
     ord match {
       case ordser: OrderedSerialization[K] =>
         val (boxfn, boxordSer) = getBoxFnAndOrder[K](ordser, flowDef)
 
         val ts = tup2Setter[(Boxed[K], V)].contraMap { kv1: (K, V) => (boxfn(kv1._1), kv1._2) }
-        val keyF = new Fields("key")
+        val keyF = new Fields("key", mf.runtimeClass)
         keyF.setComparator("key", new CascadingBinaryComparator(boxordSer))
         op(ts, keyF)
       case _ =>
         val ts = tup2Setter[(K, V)]
-        val keyF = Field.singleOrdered("key")(ord)
+        val keyF = Field.singleOrdered("key")(ord, mf)
         op(ts, keyF)
     }
 
@@ -170,17 +171,21 @@ object Grouped {
  * of each key in memory on the reducer.
  */
 trait Sortable[+T, +Sorted[+_]] {
-  def withSortOrdering[U >: T](so: Ordering[U]): Sorted[T]
+  def withSortOrdering[U >: T](so: Ordering[U])(implicit mfU: ClassTag[U]): Sorted[T]
 
-  def sortBy[B: Ordering](fn: (T) => B): Sorted[T] =
+  def sortBy[B: Ordering](fn: (T) => B)(implicit mfB: ClassTag[B], mfT: ClassTag[_ >: T]): Sorted[T] = {
+    implicit val mfT2 = mfT.asInstanceOf[ClassTag[T]]
     withSortOrdering(Ordering.by(fn))
+  }
 
   // Sorts the values for each key
-  def sorted[B >: T](implicit ord: Ordering[B]): Sorted[T] =
+  def sorted[B >: T](implicit ord: Ordering[B], mfB: ClassTag[B]): Sorted[T] =
     withSortOrdering(ord)
 
-  def sortWith(lt: (T, T) => Boolean): Sorted[T] =
+  def sortWith(lt: (T, T) => Boolean)(implicit mfT: ClassTag[_ >: T]): Sorted[T] = {
+    implicit val mfT2 = mfT.asInstanceOf[ClassTag[T]]
     withSortOrdering(Ordering.fromLessThan(lt))
+  }
 }
 
 // Represents something that when we call reverse changes type to R
@@ -199,10 +204,12 @@ sealed trait ReduceStep[K, V1] extends KeyedPipe[K] {
    */
   def mapped: TypedPipe[(K, V1)]
   // make the pipe and group it, only here because it is common
-  protected def groupOp[V2](gb: GroupBuilder => GroupBuilder): TypedPipe[(K, V2)] =
-    groupOpWithValueSort[V2](None)(gb)
+  protected def groupOp[V2](gb: GroupBuilder => GroupBuilder)(implicit mfK: ClassTag[K], mfV1: ClassTag[V1], mfV2: ClassTag[V2]): TypedPipe[(K, V2)] =
+    groupOpWithValueSort[V2, V1](None)(gb)
 
-  protected def groupOpWithValueSort[V2](valueSort: Option[Ordering[_ >: V1]])(gb: GroupBuilder => GroupBuilder): TypedPipe[(K, V2)] =
+  protected def groupOpWithValueSort[V2, V1X >: V1](valueSort: Option[Ordering[V1X]])(gb: GroupBuilder => GroupBuilder)(implicit mfK: ClassTag[K], mfV1X: ClassTag[V1X], mfV2: ClassTag[V2]): TypedPipe[(K, V2)] = {
+    implicit val mfV1 = mfV1X.asInstanceOf[ClassTag[V1]]
+
     TypedPipeFactory({ (fd, mode) =>
       val pipe = Grouped.maybeBox[K, V1](keyOrdering, fd) { (tupleSetter, fields) =>
         val (sortOpt, ts) = valueSort.map { vs =>
@@ -218,7 +225,7 @@ sealed trait ReduceStep[K, V1] extends KeyedPipe[K] {
               val ts2 = tupleSetter.asInstanceOf[TupleSetter[(K, Boxed[V1])]].contraMap { kv1: (K, V1) => (kv1._1, boxfn(kv1._2)) }
               (Some(valueF), ts2)
             case _ =>
-              (Some(Grouped.valueSorting(vs)), tupleSetter)
+              (Some(Grouped.valueSorting(vs, mfV1X)), tupleSetter)
           }
         }.getOrElse((None, tupleSetter))
 
@@ -232,15 +239,16 @@ sealed trait ReduceStep[K, V1] extends KeyedPipe[K] {
             gb(withSort)
           }
       }
-      TypedPipe.from(pipe, Grouped.kvFields)(fd, mode, Grouped.tuple2Conv[K, V2](keyOrdering))
+      TypedPipe.from(pipe, Grouped.kvFields)(fd, mode, Grouped.tuple2Conv[K, V2](keyOrdering), implicitly[ClassTag[(K, V2)]])
     })
+  }
 }
 
 case class IdentityReduce[K, V1](
   override val keyOrdering: Ordering[K],
   override val mapped: TypedPipe[(K, V1)],
   override val reducers: Option[Int],
-  override val descriptions: Seq[String])
+  override val descriptions: Seq[String])(implicit override val keyManifest: ClassTag[K], override val valueManifest: ClassTag[V1])
   extends ReduceStep[K, V1]
   with Grouped[K, V1] {
 
@@ -259,8 +267,8 @@ case class IdentityReduce[K, V1](
   override def bufferedTake(n: Int) =
     toUIR.bufferedTake(n)
 
-  override def withSortOrdering[U >: V1](so: Ordering[U]): IdentityValueSortedReduce[K, V1] =
-    IdentityValueSortedReduce[K, V1](keyOrdering, mapped, so, reducers, descriptions)
+  override def withSortOrdering[U >: V1](so: Ordering[U])(implicit mfU: ClassTag[U]): IdentityValueSortedReduce[K, V1, U] =
+    IdentityValueSortedReduce[K, V1, U](keyOrdering, mapped, so, reducers, descriptions)
 
   override def withReducers(red: Int): IdentityReduce[K, V1] =
     copy(reducers = Some(red))
@@ -271,20 +279,20 @@ case class IdentityReduce[K, V1](
   override def filterKeys(fn: K => Boolean) =
     toUIR.filterKeys(fn)
 
-  override def mapGroup[V3](fn: (K, Iterator[V1]) => Iterator[V3]) = {
+  override def mapGroup[V3](fn: (K, Iterator[V1]) => Iterator[V3])(implicit mfV3: ClassTag[V3]) = {
     // Only pass non-Empty iterators to subsequent functions
     IteratorMappedReduce(keyOrdering, mapped, Grouped.addEmptyGuard(fn), reducers, descriptions)
   }
 
   // It would be nice to return IdentityReduce here, but
   // the type constraints prevent it currently
-  override def mapValues[V2](fn: V1 => V2) =
+  override def mapValues[V2](fn: V1 => V2)(implicit mfV2: ClassTag[V2]) =
     toUIR.mapValues(fn)
 
   // This is not correct in the type-system, but would be nice to encode
   //override def mapValues[V3](fn: V1 => V3) = IdentityReduce(keyOrdering, mapped.mapValues(fn), reducers)
 
-  override def sum[U >: V1](implicit sg: Semigroup[U]) = {
+  override def sum[U >: V1](implicit sg: Semigroup[U], mfU: ClassTag[U]) = {
     // there is no sort, mapValueStream or force to reducers:
     val upipe: TypedPipe[(K, U)] = mapped // use covariance to set the type
     UnsortedIdentityReduce(keyOrdering, upipe.sumByLocalKeys, reducers, descriptions).sumLeft
@@ -294,7 +302,7 @@ case class IdentityReduce[K, V1](
     case None => mapped // free case
     case Some(reds) =>
       // This is weird, but it is sometimes used to force a partition
-      groupOp { _.reducers(reds).setDescriptions(descriptions) }
+      groupOp(_.reducers(reds).setDescriptions(descriptions))(keyManifest, valueManifest, valueManifest)
   }
 
   /** This is just an identity that casts the result to V1 */
@@ -305,7 +313,7 @@ case class UnsortedIdentityReduce[K, V1](
   override val keyOrdering: Ordering[K],
   override val mapped: TypedPipe[(K, V1)],
   override val reducers: Option[Int],
-  override val descriptions: Seq[String])
+  override val descriptions: Seq[String])(implicit override val keyManifest: ClassTag[K], override val valueManifest: ClassTag[V1])
   extends ReduceStep[K, V1]
   with UnsortedGrouped[K, V1] {
 
@@ -348,17 +356,17 @@ case class UnsortedIdentityReduce[K, V1](
   override def filterKeys(fn: K => Boolean) =
     UnsortedIdentityReduce(keyOrdering, mapped.filterKeys(fn), reducers, descriptions)
 
-  override def mapGroup[V3](fn: (K, Iterator[V1]) => Iterator[V3]) = {
+  override def mapGroup[V3](fn: (K, Iterator[V1]) => Iterator[V3])(implicit mfV3: ClassTag[V3]) = {
     // Only pass non-Empty iterators to subsequent functions
     IteratorMappedReduce(keyOrdering, mapped, Grouped.addEmptyGuard(fn), reducers, descriptions)
   }
 
   // It would be nice to return IdentityReduce here, but
   // the type constraints prevent it currently
-  override def mapValues[V2](fn: V1 => V2) =
+  override def mapValues[V2](fn: V1 => V2)(implicit mfV2: ClassTag[V2]) =
     UnsortedIdentityReduce(keyOrdering, mapped.mapValues(fn), reducers, descriptions)
 
-  override def sum[U >: V1](implicit sg: Semigroup[U]) = {
+  override def sum[U >: V1](implicit sg: Semigroup[U], mfU: ClassTag[U]) = {
     // there is no sort, mapValueStream or force to reducers:
     val upipe: TypedPipe[(K, U)] = mapped // use covariance to set the type
     UnsortedIdentityReduce(keyOrdering, upipe.sumByLocalKeys, reducers, descriptions).sumLeft
@@ -368,37 +376,38 @@ case class UnsortedIdentityReduce[K, V1](
     case None => mapped // free case
     case Some(reds) =>
       // This is weird, but it is sometimes used to force a partition
-      groupOp { _.reducers(reds).setDescriptions(descriptions) }
+      groupOp (_.reducers(reds).setDescriptions(descriptions)) (keyManifest, valueManifest, valueManifest)
   }
 
   /** This is just an identity that casts the result to V1 */
   override def joinFunction = CoGroupable.castingJoinFunction[V1]
 }
 
-case class IdentityValueSortedReduce[K, V1](
+case class IdentityValueSortedReduce[K, V1, V1X >: V1](
   override val keyOrdering: Ordering[K],
   override val mapped: TypedPipe[(K, V1)],
-  valueSort: Ordering[_ >: V1],
+  valueSort: Ordering[V1X],
   override val reducers: Option[Int],
-  override val descriptions: Seq[String]) extends ReduceStep[K, V1]
+  override val descriptions: Seq[String])(implicit override val keyManifest: ClassTag[K], override val valueManifest: ClassTag[V1],
+    val valueManifestX: ClassTag[V1X]) extends ReduceStep[K, V1]
   with SortedGrouped[K, V1]
-  with Reversable[IdentityValueSortedReduce[K, V1]] {
+  with Reversable[IdentityValueSortedReduce[K, V1, V1X]] {
 
-  override def reverse: IdentityValueSortedReduce[K, V1] =
-    IdentityValueSortedReduce[K, V1](keyOrdering, mapped, valueSort.reverse, reducers, descriptions)
+  override def reverse: IdentityValueSortedReduce[K, V1, V1X] =
+    IdentityValueSortedReduce[K, V1, V1X](keyOrdering, mapped, valueSort.reverse, reducers, descriptions)
 
-  override def withReducers(red: Int): IdentityValueSortedReduce[K, V1] =
+  override def withReducers(red: Int): IdentityValueSortedReduce[K, V1, V1X] =
     // copy fails to get the types right, :/
-    IdentityValueSortedReduce[K, V1](keyOrdering, mapped, valueSort, reducers = Some(red), descriptions)
+    IdentityValueSortedReduce[K, V1, V1X](keyOrdering, mapped, valueSort, reducers = Some(red), descriptions)
 
-  override def withDescription(description: String): IdentityValueSortedReduce[K, V1] =
-    IdentityValueSortedReduce[K, V1](keyOrdering, mapped, valueSort, reducers, descriptions = descriptions :+ description)
+  override def withDescription(description: String): IdentityValueSortedReduce[K, V1, V1X] =
+    IdentityValueSortedReduce[K, V1, V1X](keyOrdering, mapped, valueSort, reducers, descriptions = descriptions :+ description)
 
   override def filterKeys(fn: K => Boolean) =
     // copy fails to get the types right, :/
-    IdentityValueSortedReduce[K, V1](keyOrdering, mapped.filterKeys(fn), valueSort, reducers, descriptions)
+    IdentityValueSortedReduce[K, V1, V1X](keyOrdering, mapped.filterKeys(fn), valueSort, reducers, descriptions)
 
-  override def mapGroup[V3](fn: (K, Iterator[V1]) => Iterator[V3]) = {
+  override def mapGroup[V3](fn: (K, Iterator[V1]) => Iterator[V3])(implicit mfV3: ClassTag[V3]) = {
     // Only pass non-Empty iterators to subsequent functions
     ValueSortedReduce[K, V1, V3](keyOrdering, mapped, valueSort, Grouped.addEmptyGuard(fn), reducers, descriptions)
   }
@@ -419,7 +428,7 @@ case class IdentityValueSortedReduce[K, V1](
         .sumByLocalKeys
         .flatMap { case (k, vs) => vs.iterator.asScala.map((k, _)) }
       // Now finish on the reducers
-      IdentityValueSortedReduce[K, V1](keyOrdering, pretake, valueSort, reducers, descriptions)
+      IdentityValueSortedReduce[K, V1, V1X](keyOrdering, pretake, valueSort, reducers, descriptions)
         .forceToReducers // jump to ValueSortedReduce
         .take(n)
     }
@@ -435,7 +444,7 @@ case class IdentityValueSortedReduce[K, V1](
     else mapValueStream(_.take(n))
 
   override lazy val toTypedPipe =
-    groupOpWithValueSort[V1](valueSort = Some(valueSort)) { gb =>
+    groupOpWithValueSort[V1, V1X](valueSort = Some(valueSort)) { gb =>
       // If its an ordered serialization we need to unbox
       val mappedGB =
         if (valueSort.isInstanceOf[OrderedSerialization[_]])
@@ -457,7 +466,9 @@ case class ValueSortedReduce[K, V1, V2](
   valueSort: Ordering[_ >: V1],
   reduceFn: (K, Iterator[V1]) => Iterator[V2],
   override val reducers: Option[Int],
-  override val descriptions: Seq[String])
+  override val descriptions: Seq[String])(implicit override val keyManifest: ClassTag[K],
+    val valueManifest1: ClassTag[V1],
+    override val valueManifest: ClassTag[V2])
   extends ReduceStep[K, V1] with SortedGrouped[K, V2] {
 
   /**
@@ -479,7 +490,7 @@ case class ValueSortedReduce[K, V1, V2](
     // copy fails to get the types right, :/
     ValueSortedReduce[K, V1, V2](keyOrdering, mapped.filterKeys(fn), valueSort, reduceFn, reducers, descriptions)
 
-  override def mapGroup[V3](fn: (K, Iterator[V2]) => Iterator[V3]) = {
+  override def mapGroup[V3](fn: (K, Iterator[V2]) => Iterator[V3])(implicit mfV3: ClassTag[V3]) = {
     // don't make a closure
     val localRed = reduceFn
     val newReduce = { (k: K, iter: Iterator[V1]) =>
@@ -493,7 +504,7 @@ case class ValueSortedReduce[K, V1, V2](
 
   override lazy val toTypedPipe = {
     val optVOrdering = Some(valueSort)
-    groupOpWithValueSort(optVOrdering) {
+    groupOpWithValueSort(optVOrdering) (
       // If its an ordered serialization we need to unbox
       // the value before handing it to the users operation
       _.every(new cascading.pipe.Every(_, Grouped.valueField,
@@ -502,8 +513,7 @@ case class ValueSortedReduce[K, V1, V2](
           reduceFn,
           Grouped.valueField), Fields.REPLACE))
         .reducers(reducers.getOrElse(-1))
-        .setDescriptions(descriptions)
-    }
+        .setDescriptions(descriptions))(keyManifest, null /* FIXME / HELP ME */ , valueManifest)
   }
 }
 
@@ -512,7 +522,8 @@ case class IteratorMappedReduce[K, V1, V2](
   override val mapped: TypedPipe[(K, V1)],
   reduceFn: (K, Iterator[V1]) => Iterator[V2],
   override val reducers: Option[Int],
-  override val descriptions: Seq[String])
+  override val descriptions: Seq[String])(implicit override val keyManifest: ClassTag[K],
+    val valueManifest1: ClassTag[V1], override val valueManifest: ClassTag[V2])
   extends ReduceStep[K, V1] with UnsortedGrouped[K, V2] {
 
   /**
@@ -530,7 +541,7 @@ case class IteratorMappedReduce[K, V1, V2](
   override def filterKeys(fn: K => Boolean) =
     copy(mapped = mapped.filterKeys(fn))
 
-  override def mapGroup[V3](fn: (K, Iterator[V2]) => Iterator[V3]) = {
+  override def mapGroup[V3](fn: (K, Iterator[V2]) => Iterator[V3])(implicit mfV3: ClassTag[V3]) = {
     // don't make a closure
     val localRed = reduceFn
     val newReduce = { (k: K, iter: Iterator[V1]) =>
@@ -542,12 +553,11 @@ case class IteratorMappedReduce[K, V1, V2](
   }
 
   override lazy val toTypedPipe =
-    groupOp {
+    groupOp (
       _.every(new cascading.pipe.Every(_, Grouped.valueField,
         new TypedBufferOp(Grouped.keyConverter(keyOrdering), TupleConverter.singleConverter[V1], reduceFn, Grouped.valueField), Fields.REPLACE))
         .reducers(reducers.getOrElse(-1))
-        .setDescriptions(descriptions)
-    }
+        .setDescriptions(descriptions)) (keyManifest, valueManifest1, valueManifest)
 
   override def joinFunction = {
     // don't make a closure

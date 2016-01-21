@@ -1,6 +1,7 @@
 package com.twitter.scalding.typed
 
 import com.twitter.algebird._
+import scala.reflect.ClassTag
 
 /**
  * Extension for TypedPipe to add a cumulativeSum method.
@@ -33,13 +34,16 @@ object CumulativeSum {
   implicit def toCumulativeSum[K, U, V](pipe: TypedPipe[(K, (U, V))]) =
     new CumulativeSumExtension(pipe)
 
+  implicit val mfA = Manifest.classType[Any](classOf[Any])
+
   class CumulativeSumExtension[K, U, V](
     val pipe: TypedPipe[(K, (U, V))]) {
     /** Takes a sortable field and a monoid and returns the cumulative sum of that monoid **/
     def cumulativeSum(
       implicit sg: Semigroup[V],
       ordU: Ordering[U],
-      ordK: Ordering[K]): SortedGrouped[K, (U, V)] = {
+      ordK: Ordering[K],
+      mfK: ClassTag[K], mfU: ClassTag[U], mfV: ClassTag[V]): SortedGrouped[K, (U, V)] = {
       pipe.group
         .sortBy { case (u, _) => u }
         .scanLeft(Nil: List[(U, V)]) {
@@ -62,7 +66,11 @@ object CumulativeSum {
       implicit ordS: Ordering[S],
       sg: Semigroup[V],
       ordU: Ordering[U],
-      ordK: Ordering[K]): TypedPipe[(K, (U, V))] = {
+      ordK: Ordering[K],
+      mfS: ClassTag[S],
+      mfK: ClassTag[K],
+      mfU: ClassTag[U],
+      mfV: ClassTag[V]): TypedPipe[(K, (U, V))] = {
 
       val sumPerS = pipe
         .map { case (k, (u, v)) => (k, partition(u)) -> v }

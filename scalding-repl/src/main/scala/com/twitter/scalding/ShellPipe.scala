@@ -15,6 +15,8 @@
 
 package com.twitter.scalding
 
+import scala.reflect.ClassTag
+
 /**
  * Enrichment on TypedPipes allowing them to be run locally, independent of the overall flow.
  * @param pipe to wrap
@@ -25,14 +27,14 @@ class ShellTypedPipe[T](pipe: TypedPipe[T])(implicit state: BaseReplState) {
   /**
    * Shorthand for .write(dest).run
    */
-  def save(dest: TypedSink[T] with TypedSource[T]): TypedPipe[T] =
+  def save(dest: TypedSink[T] with TypedSource[T])(implicit mfT: ClassTag[T]): TypedPipe[T] =
     execute(pipe.writeThrough(dest))
 
   /**
    * Save snapshot of a typed pipe to a temporary sequence file.
    * @return A TypedPipe to a new Source, reading from the sequence file.
    */
-  def snapshot: TypedPipe[T] =
+  def snapshot(implicit mfT: ClassTag[T]): TypedPipe[T] =
     execute(pipe.forceToDiskExecution)
 
   /**

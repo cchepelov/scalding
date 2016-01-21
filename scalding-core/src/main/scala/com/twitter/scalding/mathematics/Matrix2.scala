@@ -24,7 +24,7 @@ import com.twitter.scalding.typed.{ ValuePipe, EmptyValue, LiteralValue, Compute
 import com.twitter.algebird.{ Semigroup, Monoid, Ring, Group, Field }
 import scala.collection.mutable.Map
 import scala.collection.mutable.HashMap
-
+import scala.reflect.ClassTag
 import java.io.Serializable
 
 /**
@@ -44,6 +44,10 @@ import java.io.Serializable
 sealed trait Matrix2[R, C, V] extends Serializable {
   implicit def rowOrd: Ordering[R]
   implicit def colOrd: Ordering[C]
+  implicit def rowManifest: ClassTag[R]
+  implicit def colManifest: ClassTag[C]
+  implicit def valueManifest: ClassTag[V]
+
   val sizeHint: SizeHint = NoClue
   def +(that: Matrix2[R, C, V])(implicit mon: Monoid[V]): Matrix2[R, C, V] = Sum(this, that, mon)
   def -(that: Matrix2[R, C, V])(implicit g: Group[V]): Matrix2[R, C, V] = Sum(this, that.negate, g)
@@ -54,7 +58,7 @@ sealed trait Matrix2[R, C, V] extends Serializable {
    */
   def #*#(that: Matrix2[R, C, V])(implicit ring: Ring[V]): Matrix2[R, C, V] = HadamardProduct(this, that, ring)
   // Matrix product
-  def *[C2](that: Matrix2[C, C2, V])(implicit ring: Ring[V], mj: MatrixJoiner2): Matrix2[R, C2, V] =
+  def *[C2](that: Matrix2[C, C2, V])(implicit ring: Ring[V], mj: MatrixJoiner2, mfC2: ClassTag[C2]): Matrix2[R, C2, V] =
     Product(this, that, ring)
 
   def *(that: Scalar2[V])(implicit ring: Ring[V], mj: MatrixJoiner2): Matrix2[R, C, V] = that * this
@@ -88,8 +92,10 @@ sealed trait Matrix2[R, C, V] extends Serializable {
   }
 
   // TODO: complete the rest of the API to match the old Matrix API (many methods are effectively on the TypedPipe)
-  def sumColVectors(implicit ring: Ring[V], mj: MatrixJoiner2): Matrix2[R, Unit, V] =
-    Product(this, OneC()(colOrd), ring)
+  def sumColVectors(implicit ring: Ring[V], mj: MatrixJoiner2): Matrix2[R, Unit, V] = {
+    implicit val unitManifest = Manifest.classType[Unit](classOf[Unit])
+    Product(this, OneC()(colOrd, colManifest, unitManifest, valueManifest), ring)
+  }
 
   /**
    * the result is the same as considering everything on the this to be like a 1 value
@@ -100,11 +106,13 @@ sealed trait Matrix2[R, C, V] extends Serializable {
    */
   def propagate[C2, VecV](vec: Matrix2[C, C2, VecV])(implicit ev: =:=[V, Boolean],
     mon: Monoid[VecV],
-    mj: MatrixJoiner2): Matrix2[R, C2, VecV] = {
+    mj: MatrixJoiner2, mfV: ClassTag[VecV]): Matrix2[R, C2, VecV] = {
 
     //This cast will always succeed:
     lazy val joinedBool = mj.join(this.asInstanceOf[Matrix2[R, C, Boolean]], vec)
     implicit val ord2: Ordering[C2] = vec.colOrd
+    implicit val mfc2: ClassTag[C2] = vec.colManifest
+
     lazy val resultPipe = joinedBool.flatMap {
       case (key, ((row, bool), (col2, v))) =>
         if (bool) Some((row, col2), v) else None // filter early
@@ -116,11 +124,11 @@ sealed trait Matrix2[R, C, V] extends Serializable {
     MatrixLiteral(resultPipe, this.sizeHint)
   }
 
-  def propagateRow[C2](mat: Matrix2[C, C2, Boolean])(implicit ev: =:=[R, Unit], mon: Monoid[V], mj: MatrixJoiner2): Matrix2[Unit, C2, V] =
+  def propagateRow[C2](mat: Matrix2[C, C2, Boolean])(implicit ev: =:=[R, Unit], mon: Monoid[V], mj: MatrixJoiner2, mfC: ClassTag[C], mfC2: ClassTag[C2]): Matrix2[Unit, C2, V] =
     mat.transpose.propagate(this.transpose.asInstanceOf[Matrix2[C, Unit, V]]).transpose
 
   // Binarize values, all x != 0 become 1
-  def binarizeAs[NewValT](implicit mon: Monoid[V], ring: Ring[NewValT]): Matrix2[R, C, NewValT] = {
+  def binarizeAs[NewValT](implicit mon: Monoid[V], ring: Ring[NewValT], mf: ClassTag[NewValT]): Matrix2[R, C, NewValT] = {
     lazy val newPipe = toTypedPipe.map {
       case (r, c, x) =>
         (r, c, if (mon.isNonZero(x)) { ring.one } else { ring.zero })
@@ -171,10 +179,10 @@ sealed trait Matrix2[R, C, V] extends Serializable {
    * Consider this Matrix as the r2 row of a matrix. The current matrix must be a row,
    * which is to say, its row type must be Unit.
    */
-  def asRow[R2](r2: R2)(implicit ev: R =:= Unit, rowOrd: Ordering[R2]): Matrix2[R2, C, V] =
+  def asRow[R2](r2: R2)(implicit ev: R =:= Unit, rowOrd: Ordering[R2], mf: ClassTag[R2]): Matrix2[R2, C, V] =
     MatrixLiteral(toTypedPipe.map { case (r, c, v) => (r2, c, v) }, this.sizeHint)
 
-  def asCol[C2](c2: C2)(implicit ev: C =:= Unit, colOrd: Ordering[C2]): Matrix2[R, C2, V] =
+  def asCol[C2](c2: C2)(implicit ev: C =:= Unit, colOrd: Ordering[C2], mf: ClassTag[C2]): Matrix2[R, C2, V] =
     MatrixLiteral(toTypedPipe.map { case (r, c, v) => (r, c2, v) }, this.sizeHint)
 
   // Compute the sum of the main diagonal.  Only makes sense cases where the row and col type are
@@ -183,7 +191,7 @@ sealed trait Matrix2[R, C, V] extends Serializable {
     Scalar2(toTypedPipe.asInstanceOf[TypedPipe[(R, R, V)]]
       .filter{ case (r1, r2, _) => Ordering[R].equiv(r1, r2) }
       .map{ case (_, _, x) => x }
-      .sum(mon))
+      .sum(mon, valueManifest))
 
   def write(sink: TypedSink[(R, C, V)])(implicit fd: FlowDef, m: Mode): Matrix2[R, C, V] =
     MatrixLiteral(toTypedPipe.write(sink), sizeHint)
@@ -196,7 +204,7 @@ sealed trait Matrix2[R, C, V] extends Serializable {
  * special handling
  */
 trait MatrixJoiner2 extends java.io.Serializable {
-  def join[R, C, V, C2, V2](left: Matrix2[R, C, V], right: Matrix2[C, C2, V2]): TypedPipe[(C, ((R, V), (C2, V2)))]
+  def join[R, C, V, C2, V2](left: Matrix2[R, C, V], right: Matrix2[C, C2, V2])(implicit mfC: ClassTag[C], mfR: ClassTag[R]): TypedPipe[(C, ((R, V), (C2, V2)))]
 }
 
 object MatrixJoiner2 {
@@ -205,7 +213,7 @@ object MatrixJoiner2 {
   implicit def default: MatrixJoiner2 = new DefaultMatrixJoiner(10000L)
 
   def join[R, C, V, C2, V2](left: Matrix2[R, C, V],
-    right: Matrix2[C, C2, V2])(implicit mj: MatrixJoiner2): TypedPipe[(C, ((R, V), (C2, V2)))] =
+    right: Matrix2[C, C2, V2])(implicit mj: MatrixJoiner2, mfC: ClassTag[C], mfR: ClassTag[R]): TypedPipe[(C, ((R, V), (C2, V2)))] =
     mj.join(left, right)
 }
 
@@ -215,14 +223,19 @@ object MatrixJoiner2 {
  */
 class DefaultMatrixJoiner(sizeRatioThreshold: Long) extends MatrixJoiner2 {
   def join[R, C, V, C2, V2](left: Matrix2[R, C, V],
-    right: Matrix2[C, C2, V2]): TypedPipe[(C, ((R, V), (C2, V2)))] = {
+    right: Matrix2[C, C2, V2])(implicit mfC: ClassTag[C], mfR: ClassTag[R]): TypedPipe[(C, ((R, V), (C2, V2)))] = {
     implicit val cOrd: Ordering[C] = left.colOrd
+    implicit val mfC: ClassTag[C] = left.colManifest
+    implicit val mfV: ClassTag[V] = left.valueManifest
+    implicit val mfC2: ClassTag[C2] = right.colManifest
+    implicit val mfV2: ClassTag[V2] = right.valueManifest
+
     val one = left.toTypedPipe.map { case (r, c, v) => (c, (r, v)) }.group
     val two = right.toTypedPipe.map { case (c, c2, v2) => (c, (c2, v2)) }.group
     val sizeOne = left.sizeHint.total.getOrElse(BigInt(1L))
     val sizeTwo = right.sizeHint.total.getOrElse(BigInt(1L))
 
-    def swapInner[M, N](t: TypedPipe[(C, (M, N))]): TypedPipe[(C, (N, M))] = t.mapValues { t: (M, N) => t.swap }
+    def swapInner[M, N](t: TypedPipe[(C, (M, N))])(implicit mfM: ClassTag[M], mfN: ClassTag[N]): TypedPipe[(C, (N, M))] = t.mapValues { t: (M, N) => t.swap }
     // TODO:
     // use block join on tall skinny times skinny tall (or skewed): the result really big,
     // but the direct approach can't get much parallelism.
@@ -242,7 +255,10 @@ class DefaultMatrixJoiner(sizeRatioThreshold: Long) extends MatrixJoiner2 {
 /**
  * Infinite column vector - only for intermediate computations
  */
-case class OneC[R, V](implicit override val rowOrd: Ordering[R]) extends Matrix2[R, Unit, V] {
+case class OneC[R, V](implicit override val rowOrd: Ordering[R],
+  override val rowManifest: ClassTag[R],
+  override val colManifest: ClassTag[Unit],
+  override val valueManifest: ClassTag[V]) extends Matrix2[R, Unit, V] {
   override val sizeHint: SizeHint = FiniteHint(Long.MaxValue, 1)
   override def colOrd = Ordering[Unit]
   def transpose = OneR()
@@ -253,7 +269,10 @@ case class OneC[R, V](implicit override val rowOrd: Ordering[R]) extends Matrix2
 /**
  * Infinite row vector - only for intermediate computations
  */
-case class OneR[C, V](implicit override val colOrd: Ordering[C]) extends Matrix2[Unit, C, V] {
+case class OneR[C, V](implicit override val colOrd: Ordering[C],
+  override val rowManifest: ClassTag[Unit],
+  override val colManifest: ClassTag[C],
+  override val valueManifest: ClassTag[V]) extends Matrix2[Unit, C, V] {
   override val sizeHint: SizeHint = FiniteHint(1, Long.MaxValue)
   override def rowOrd = Ordering[Unit]
   def transpose = OneC()
@@ -272,7 +291,11 @@ case class OneR[C, V](implicit override val colOrd: Ordering[C]) extends Matrix2
 case class Product[R, C, C2, V](left: Matrix2[R, C, V],
   right: Matrix2[C, C2, V],
   ring: Ring[V],
-  expressions: Option[Map[Matrix2[R, C2, V], TypedPipe[(R, C2, V)]]] = None)(implicit val joiner: MatrixJoiner2) extends Matrix2[R, C2, V] {
+  expressions: Option[Map[Matrix2[R, C2, V], TypedPipe[(R, C2, V)]]] = None)(implicit val joiner: MatrixJoiner2,
+    override val rowManifest: ClassTag[R],
+    override val colManifest: ClassTag[C2],
+    val otherColManifest: ClassTag[C],
+    override val valueManifest: ClassTag[V]) extends Matrix2[R, C2, V] {
 
   /**
    * Structural, NOT mathematical equality (e.g. (A*B) * C != A * (B*C))
@@ -294,13 +317,14 @@ case class Product[R, C, C2, V](left: Matrix2[R, C, V],
     val localRing = ring
 
     val joined = (if (leftMatrix) {
-      val ord: Ordering[R] = left.rowOrd
-      left.toTypedPipe.groupBy(x => x._1)(ord)
+      /*implicit val ord: Ordering[R] = left.rowOrd
+      implicit val mf: ClassTag[R] = left.rowManifest */
+      left.toTypedPipe.groupBy(x => x._1)
     } else {
-      val ord: Ordering[C] = right.rowOrd
-      right.toTypedPipe.groupBy(x => x._1)(ord)
+      implicit val ord: Ordering[C] = right.rowOrd
+      right.toTypedPipe.groupBy(x => x._1)
     }).mapValues { _._3 }
-      .sum(localRing)
+      .sum(localRing, valueManifest)
       .filter { kv => localRing.isNonZero(kv._2) }
 
     if (leftMatrix) {
@@ -334,7 +358,7 @@ case class Product[R, C, C2, V](left: Matrix2[R, C, V],
     } else {
       val localRing = ring
       joined.groupBy(w => (w._1, w._2)).mapValues { _._3 }
-        .sum(localRing)
+        .sum(localRing, valueManifest)
         .filter { kv => localRing.isNonZero(kv._2) }
         .map { case ((r, c), v) => (r, c, v) }
     }
@@ -382,18 +406,21 @@ case class Product[R, C, C2, V](left: Matrix2[R, C, V],
       val product2 = plan2.asInstanceOf[Product[C, R, C, V]]
       val ord = left.colOrd
       val filtered = product2.toOuterSum.filter{ case (c1, c2, _) => ord.equiv(c1, c2) }
-      Scalar2(product2.computePipe(filtered).map{ case (_, _, x) => x }.sum(mon))
+      Scalar2(product2.computePipe(filtered).map{ case (_, _, x) => x }.sum(mon, valueManifest))
     } else {
       val product1 = plan1.asInstanceOf[Product[R, C, R, V]]
       val ord = left.rowOrd
       val filtered = product1.toOuterSum.filter{ case (r1, r2, _) => ord.equiv(r1, r2) }
-      Scalar2(product1.computePipe(filtered).map{ case (_, _, x) => x }.sum(mon))
+      Scalar2(product1.computePipe(filtered).map{ case (_, _, x) => x }.sum(mon, valueManifest))
     }
 
   }
 }
 
-case class Sum[R, C, V](left: Matrix2[R, C, V], right: Matrix2[R, C, V], mon: Monoid[V]) extends Matrix2[R, C, V] {
+case class Sum[R, C, V](left: Matrix2[R, C, V], right: Matrix2[R, C, V], mon: Monoid[V])(implicit override val colManifest: ClassTag[C],
+  override val rowManifest: ClassTag[R],
+  override val valueManifest: ClassTag[V]) extends Matrix2[R, C, V] {
+
   def collectAddends(sum: Sum[R, C, V]): List[TypedPipe[(R, C, V)]] = {
     def getLiteral(mat: Matrix2[R, C, V]): TypedPipe[(R, C, V)] = {
       mat match {
@@ -427,7 +454,7 @@ case class Sum[R, C, V](left: Matrix2[R, C, V], right: Matrix2[R, C, V], mon: Mo
       collectAddends(this)
         .reduce((x, y) => x ++ y)
         .groupBy(x => (x._1, x._2)).mapValues { _._3 }
-        .sum(mon)
+        .sum(mon, valueManifest)
         .filter { kv => mon.isNonZero(kv._2) }
         .map { case ((r, c), v) => (r, c, v) }
     }
@@ -454,7 +481,9 @@ case class Sum[R, C, V](left: Matrix2[R, C, V], right: Matrix2[R, C, V], mon: Mo
 
 case class HadamardProduct[R, C, V](left: Matrix2[R, C, V],
   right: Matrix2[R, C, V],
-  ring: Ring[V]) extends Matrix2[R, C, V] {
+  ring: Ring[V])(implicit override val colManifest: ClassTag[C],
+    override val rowManifest: ClassTag[R],
+    override val valueManifest: ClassTag[V]) extends Matrix2[R, C, V] {
 
   // TODO: optimize / combine with Sums: https://github.com/tomtau/scalding/issues/14#issuecomment-22971582
   override lazy val toTypedPipe: TypedPipe[(R, C, V)] = {
@@ -472,7 +501,8 @@ case class HadamardProduct[R, C, V](left: Matrix2[R, C, V],
     }
   }
 
-  override lazy val transpose: MatrixLiteral[C, R, V] = MatrixLiteral(toTypedPipe.map(x => (x._2, x._1, x._3)), sizeHint.transpose)(colOrd, rowOrd)
+  override lazy val transpose: MatrixLiteral[C, R, V] =
+    MatrixLiteral(toTypedPipe.map(x => (x._2, x._1, x._3)), sizeHint.transpose)(colOrd, rowOrd, colManifest, rowManifest, valueManifest)
   override val sizeHint = left.sizeHint #*# right.sizeHint
   override def negate(implicit g: Group[V]): HadamardProduct[R, C, V] =
     if (left.sizeHint.total.getOrElse(BigInt(0L)) > right.sizeHint.total.getOrElse(BigInt(0L)))
@@ -486,11 +516,14 @@ case class HadamardProduct[R, C, V](left: Matrix2[R, C, V],
 }
 
 case class MatrixLiteral[R, C, V](override val toTypedPipe: TypedPipe[(R, C, V)],
-  override val sizeHint: SizeHint)(implicit override val rowOrd: Ordering[R], override val colOrd: Ordering[C])
-  extends Matrix2[R, C, V] {
+  override val sizeHint: SizeHint)(implicit override val rowOrd: Ordering[R], override val colOrd: Ordering[C],
+    override val rowManifest: ClassTag[R],
+    override val colManifest: ClassTag[C],
+    override val valueManifest: ClassTag[V]) extends Matrix2[R, C, V] {
 
-  override lazy val transpose: MatrixLiteral[C, R, V] =
-    MatrixLiteral(toTypedPipe.map(x => (x._2, x._1, x._3)), sizeHint.transpose)(colOrd, rowOrd)
+  override lazy val transpose: MatrixLiteral[C, R, V] = {
+    MatrixLiteral(toTypedPipe.map(x => (x._2, x._1, x._3)), sizeHint.transpose)(colOrd, rowOrd, colManifest, rowManifest, valueManifest)
+  }
 
   override def negate(implicit g: Group[V]): MatrixLiteral[R, C, V] =
     MatrixLiteral(toTypedPipe.map(x => (x._1, x._2, g.negate(x._3))), sizeHint)
@@ -502,7 +535,7 @@ case class MatrixLiteral[R, C, V](override val toTypedPipe: TypedPipe[(R, C, V)]
 trait Scalar2[V] extends Serializable {
   def value: ValuePipe[V]
 
-  def +(that: Scalar2[V])(implicit sg: Semigroup[V]): Scalar2[V] = {
+  def +(that: Scalar2[V])(implicit sg: Semigroup[V], mfV: ClassTag[V]): Scalar2[V] = {
     (value, that.value) match {
       case (EmptyValue, _) => that
       case (LiteralValue(v1), _) => that.map(sg.plus(v1, _))
@@ -510,23 +543,28 @@ trait Scalar2[V] extends Serializable {
       case (_, LiteralValue(v2)) => map(sg.plus(_, v2))
       // TODO: optimize sums of scalars like sums of matrices:
       // only one M/R pass for the whole Sum.
-      case (_, ComputedValue(v2)) => Scalar2((value ++ v2).sum(sg))
+      case (_, ComputedValue(v2)) => Scalar2((value ++ v2).sum(sg, mfV))
     }
   }
-  def -(that: Scalar2[V])(implicit g: Group[V]): Scalar2[V] = this + that.map(x => g.negate(x))
-  def *(that: Scalar2[V])(implicit ring: Ring[V]): Scalar2[V] =
+  def -(that: Scalar2[V])(implicit g: Group[V], mfV: ClassTag[V]): Scalar2[V] = this + that.map(x => g.negate(x))
+  def *(that: Scalar2[V])(implicit ring: Ring[V], mfV: ClassTag[V]): Scalar2[V] =
     Scalar2(ValuePipe.fold(value, that.value)(ring.times _))
-  def /(that: Scalar2[V])(implicit f: Field[V]): Scalar2[V] =
+  def /(that: Scalar2[V])(implicit f: Field[V], mfV: ClassTag[V]): Scalar2[V] =
     Scalar2(ValuePipe.fold(value, that.value)(f.div _))
-  def unary_-(implicit g: Group[V]): Scalar2[V] = map(x => g.negate(x))
+  def unary_-(implicit g: Group[V], mfV: ClassTag[V]): Scalar2[V] = map(x => g.negate(x))
 
-  def *[R, C](that: Matrix2[R, C, V])(implicit ring: Ring[V], mj: MatrixJoiner2): Matrix2[R, C, V] =
+  def *[R, C](that: Matrix2[R, C, V])(implicit ring: Ring[V], mj: MatrixJoiner2, rowManifest: ClassTag[R], colManifest: ClassTag[C]): Matrix2[R, C, V] = {
+    implicit val valueManifest = that.valueManifest.asInstanceOf[ClassTag[V]]
+    implicit val rowManifest = that.rowManifest
+
     that match {
       case p @ Product(left, right, _, expressions) =>
         if (left.sizeHint.total.getOrElse(BigInt(0L)) > right.sizeHint.total.getOrElse(BigInt(0L)))
-          Product(left, (this * right), ring, expressions)(p.joiner)
+          Product(left, (this * right), ring, expressions)(joiner = p.joiner, rowManifest = p.rowManifest,
+            colManifest = p.colManifest, otherColManifest = p.otherColManifest, valueManifest = p.valueManifest)
         else
-          Product(this * left, right, ring, expressions)(p.joiner)
+          Product(this * left, right, ring, expressions)(joiner = p.joiner, rowManifest = p.rowManifest,
+            colManifest = p.colManifest, otherColManifest = p.otherColManifest, valueManifest = p.valueManifest)
       case HadamardProduct(left, right, _) =>
         if (left.sizeHint.total.getOrElse(BigInt(0L)) > right.sizeHint.total.getOrElse(BigInt(0L)))
           HadamardProduct(left, (this * right), ring)
@@ -534,34 +572,35 @@ trait Scalar2[V] extends Serializable {
           HadamardProduct(this * left, right, ring)
       case s @ Sum(left, right, mon) => Sum(this * left, this * right, mon)
       case m @ MatrixLiteral(_, _) => timesLiteral(m) // handle literals here
-      case x @ OneC() =>
+      case x: OneC[_, _] =>
         Product(OneC[Unit, V](), toMatrix, ring)
           .asInstanceOf[Matrix2[R, C, V]]
-      case x @ OneR() =>
+      case x: OneR[_, _] =>
         Product(toMatrix, OneR[Unit, V](), ring)
           .asInstanceOf[Matrix2[R, C, V]]
     }
+  }
 
-  def divMatrix[R, C](that: Matrix2[R, C, V])(implicit f: Field[V]): MatrixLiteral[R, C, V] =
+  def divMatrix[R, C](that: Matrix2[R, C, V])(implicit f: Field[V], mfR: ClassTag[R], mfC: ClassTag[C], mfV: ClassTag[V]): MatrixLiteral[R, C, V] =
     MatrixLiteral(
       that.toTypedPipe
         .mapWithValue(value) {
           case ((r, c, v), optV) =>
             (r, c, f.div(v, optV.getOrElse(f.zero)))
         },
-      that.sizeHint)(that.rowOrd, that.colOrd)
+      that.sizeHint)(that.rowOrd, that.colOrd, that.rowManifest, that.colManifest, that.valueManifest)
 
-  def timesLiteral[R, C](that: Matrix2[R, C, V])(implicit ring: Ring[V]): MatrixLiteral[R, C, V] =
+  def timesLiteral[R, C](that: Matrix2[R, C, V])(implicit ring: Ring[V], mfR: ClassTag[R], mfC: ClassTag[C], mfV: ClassTag[V]): MatrixLiteral[R, C, V] =
     MatrixLiteral(
       that.toTypedPipe
         .mapWithValue(value) {
           case ((r, c, v), optV) =>
             (r, c, ring.times(optV.getOrElse(ring.zero), v))
         },
-      that.sizeHint)(that.rowOrd, that.colOrd)
+      that.sizeHint)(that.rowOrd, that.colOrd, that.rowManifest, that.colManifest, that.valueManifest)
 
-  def map[U](fn: V => U): Scalar2[U] = Scalar2(value.map(fn))
-  def toMatrix: Matrix2[Unit, Unit, V] =
+  def map[U](fn: V => U)(implicit mfU: ClassTag[U]): Scalar2[U] = Scalar2(value.map(fn))
+  def toMatrix(implicit mfV: ClassTag[V]): Matrix2[Unit, Unit, V] =
     MatrixLiteral(value.toTypedPipe.map(v => ((), (), v)), FiniteHint(1, 1))
   // TODO: FunctionMatrix[R,C,V](fn: (R,C) => V) and a Literal scalar is just: FuctionMatrix[Unit, Unit, V]({ (_, _) => v })
 }
@@ -574,23 +613,23 @@ object Scalar2 {
   def apply[V](v: ValuePipe[V]): Scalar2[V] = ValuePipeScalar(v)
 
   // implicits can't share names, but we want the implicit
-  implicit def const[V](v: V): Scalar2[V] =
+  implicit def const[V](v: V)(implicit mfV: ClassTag[V]): Scalar2[V] =
     from(LiteralValue(v))
 
-  def apply[V](v: V): Scalar2[V] =
+  def apply[V](v: V)(implicit mfV: ClassTag[V]): Scalar2[V] =
     from(LiteralValue(v))
 }
 
 object Matrix2 {
-  def apply[R: Ordering, C: Ordering, V](t: TypedPipe[(R, C, V)], hint: SizeHint): Matrix2[R, C, V] =
+  def apply[R: Ordering, C: Ordering, V](t: TypedPipe[(R, C, V)], hint: SizeHint)(implicit mfR: ClassTag[R], mfC: ClassTag[C], mfV: ClassTag[V]): Matrix2[R, C, V] =
     MatrixLiteral(t, hint)
 
   def read[R, C, V](t: TypedSource[(R, C, V)],
-    hint: SizeHint)(implicit ordr: Ordering[R], ordc: Ordering[C]): Matrix2[R, C, V] =
+    hint: SizeHint)(implicit ordr: Ordering[R], ordc: Ordering[C], mfR: ClassTag[R], mfC: ClassTag[C], mfV: ClassTag[V]): Matrix2[R, C, V] =
     MatrixLiteral(TypedPipe.from(t), hint)
 
-  def J[R, C, V](implicit ordR: Ordering[R], ordC: Ordering[C], ring: Ring[V], mj: MatrixJoiner2) =
-    Product(OneC[R, V]()(ordR), OneR[C, V]()(ordC), ring)
+  def J[R, C, V](implicit ordR: Ordering[R], ordC: Ordering[C], ring: Ring[V], mj: MatrixJoiner2, mfR: ClassTag[R], mfC: ClassTag[C], mfV: ClassTag[V]) =
+    Product(OneC[R, V](), OneR[C, V](), ring)
 
   /**
    * The original prototype that employs the standard O(n^3) dynamic programming
@@ -599,7 +638,7 @@ object Matrix2 {
    * Now, it also "prefers" more spread out / bushy / less deep factorization
    * which reflects more the Map/Reduce nature.
    */
-  def optimizeProductChain[V](p: IndexedSeq[Matrix2[Any, Any, V]], product: Option[(Ring[V], MatrixJoiner2)]): (BigInt, Matrix2[Any, Any, V]) = {
+  def optimizeProductChain[V](p: IndexedSeq[Matrix2[Any, Any, V]], product: Option[(Ring[V], MatrixJoiner2)])(implicit mfV: ClassTag[V]): (BigInt, Matrix2[Any, Any, V]) = {
 
     val subchainCosts = HashMap.empty[(Int, Int), BigInt]
 
@@ -633,7 +672,9 @@ object Matrix2 {
         val left = generatePlan(i, k)
         val right = generatePlan(k + 1, j)
         val (ring, joiner) = product.get
-        Product(left, right, ring, Some(sharedMap))(joiner)
+        implicit val joinerx = joiner
+
+        Product(left, right, ring, Some(sharedMap))
       }
 
     }
@@ -656,7 +697,7 @@ object Matrix2 {
    * In the above example, we could also generate ABCDFG + ABCEFG and have basic blocks: ABCDFG, and ABCEFG.
    * But this would be almost twice as much work with the current cost estimation.
    */
-  def optimize[V](mf: Matrix2[Any, Any, V]): (BigInt, Matrix2[Any, Any, V]) = {
+  def optimize[V](mf: Matrix2[Any, Any, V])(implicit mfV: ClassTag[V]): (BigInt, Matrix2[Any, Any, V]) = {
 
     def pair[X, Y](x: Option[X], y: Option[Y]): Option[(X, Y)] =
       for { xi <- x; yi <- y } yield (xi, yi)

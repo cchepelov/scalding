@@ -35,6 +35,7 @@ import com.twitter.scalding.typed.TypedSink
 import org.apache.hadoop.mapred.JobConf
 import scala.annotation.meta.param
 import scala.collection.JavaConverters._
+import scala.reflect.ClassTag
 
 /**
  * Source used to write key-value pairs as byte arrays into a versioned store.
@@ -225,7 +226,7 @@ class TypedRichPipeEx[K: Ordering, V: Monoid](pipe: TypedPipe[(K, V)]) extends j
   // the pipe in using an implicit `Monoid[V]` and sinks all results
   // into the `sinkVersion` of data (or a new version) specified by
   // `src`.
-  def writeIncremental(src: VersionedKeyValSource[K, V], reducers: Int = 1)(implicit flowDef: FlowDef, mode: Mode): TypedPipe[(K, V)] = {
+  def writeIncremental(src: VersionedKeyValSource[K, V], reducers: Int = 1)(implicit flowDef: FlowDef, mode: Mode, mfK: ClassTag[K], mfV: ClassTag[V]): TypedPipe[(K, V)] = {
     val outPipe =
       if (!src.resourceExists(mode))
         pipe
@@ -235,6 +236,7 @@ class TypedRichPipeEx[K: Ordering, V: Monoid](pipe: TypedPipe[(K, V)]) extends j
           .map { case (k, v) => (k, v, 0) }
 
         val newPairs = pipe.sumByLocalKeys.map { case (k, v) => (k, v, 1) }
+        implicit val anyMf = implicitly[ClassTag[Any]]
 
         (oldPairs ++ newPairs)
           .groupBy { _._1 }

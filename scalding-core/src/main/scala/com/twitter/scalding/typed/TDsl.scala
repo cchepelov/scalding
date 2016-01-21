@@ -16,6 +16,7 @@ limitations under the License.
 package com.twitter.scalding.typed
 
 import java.io.Serializable
+import scala.reflect.ClassTag
 
 import cascading.flow.FlowDef
 import cascading.pipe.Pipe
@@ -33,10 +34,10 @@ object TDsl extends Serializable with GeneratedTupleAdders {
   implicit def pipeTExtensions(pipe: Pipe)(implicit flowDef: FlowDef, mode: Mode): PipeTExtensions =
     new PipeTExtensions(pipe, flowDef, mode)
 
-  implicit def mappableToTypedPipe[T](src: Mappable[T]): TypedPipe[T] =
+  implicit def mappableToTypedPipe[T](src: Mappable[T])(implicit mfT: ClassTag[T]): TypedPipe[T] =
     TypedPipe.from(src)
 
-  implicit def sourceToTypedPipe[T](src: TypedSource[T]): TypedPipe[T] =
+  implicit def sourceToTypedPipe[T](src: TypedSource[T])(implicit mfT: ClassTag[T]): TypedPipe[T] =
     TypedPipe.from(src)
 }
 
@@ -54,14 +55,14 @@ class PipeTExtensions(pipe: Pipe, flowDef: FlowDef, mode: Mode) extends Serializ
    *   }
    *  The above sums all the tuples and returns a TypedPipe[Int] which has the total sum.
    */
-  def typed[T, U](fielddef: (Fields, Fields))(fn: TypedPipe[T] => TypedPipe[U])(implicit conv: TupleConverter[T], setter: TupleSetter[U]): Pipe =
-    fn(TypedPipe.from(pipe, fielddef._1)(flowDef, mode, conv)).toPipe(fielddef._2)(flowDef, mode, setter)
+  def typed[T, U](fielddef: (Fields, Fields))(fn: TypedPipe[T] => TypedPipe[U])(implicit conv: TupleConverter[T], setter: TupleSetter[U], mfT: ClassTag[T], mfU: ClassTag[U]): Pipe =
+    fn(TypedPipe.from(pipe, fielddef._1)(flowDef, mode, conv, mfT)).toPipe(fielddef._2)(flowDef, mode, setter)
 
-  def toTypedPipe[T](fields: Fields)(implicit conv: TupleConverter[T]): TypedPipe[T] =
-    TypedPipe.from[T](pipe, fields)(flowDef, mode, conv)
+  def toTypedPipe[T](fields: Fields)(implicit conv: TupleConverter[T], mfT: ClassTag[T]): TypedPipe[T] =
+    TypedPipe.from[T](pipe, fields)(flowDef, mode, conv, mfT)
 
-  def packToTypedPipe[T](fields: Fields)(implicit tp: TuplePacker[T]): TypedPipe[T] = {
+  def packToTypedPipe[T](fields: Fields)(implicit tp: TuplePacker[T], mfT: ClassTag[T]): TypedPipe[T] = {
     val conv = tp.newConverter(fields)
-    toTypedPipe(fields)(conv)
+    toTypedPipe(fields)(conv, mfT)
   }
 }

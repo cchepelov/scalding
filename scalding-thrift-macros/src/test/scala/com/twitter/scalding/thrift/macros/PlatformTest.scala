@@ -20,12 +20,14 @@ import com.twitter.scalding.platform.{ HadoopPlatformJobTest, HadoopSharedPlatfo
 import com.twitter.scalding.serialization.OrderedSerialization
 import com.twitter.scalding.thrift.macros.impl.ScroogeInternalOrderedSerializationImpl
 import com.twitter.scalding.thrift.macros.scalathrift._
+
 import org.scalacheck.Arbitrary
 import org.scalatest.{ Matchers, WordSpec }
 
+import scala.reflect.ClassTag
 import scala.language.experimental.{ macros => sMacros }
 
-class CompareJob[T: OrderedSerialization](in: Iterable[T], args: Args) extends Job(args) {
+class CompareJob[T: OrderedSerialization](in: Iterable[T], args: Args)(implicit mfT: ClassTag[T]) extends Job(args) {
   TypedPipe.from(in).flatMap{ i =>
     (0 until 1).map (_ => i)
   }.map(_ -> 1L).sumByKey.map {
@@ -47,7 +49,7 @@ class PlatformTest extends WordSpec with Matchers with HadoopSharedPlatformTest 
     def g(idx: Int) = ScroogeGenerators.dataProvider[T](idx)
   }
 
-  def runCompareTest[T: OrderedSerialization](implicit iprov: InstanceProvider[T]) {
+  def runCompareTest[T: OrderedSerialization](iprov: InstanceProvider[T])(implicit mfT: ClassTag[T]) {
     val input = (0 until 10000).map { idx =>
       iprov.g(idx % 50)
     }
@@ -67,36 +69,43 @@ class PlatformTest extends WordSpec with Matchers with HadoopSharedPlatformTest 
   "ThriftStruct Test" should {
 
     "Expected items should match : Internal Serializer / TestStructdd" in {
-      runCompareTest[TestStruct](toScroogeInternalOrderedSerialization[TestStruct], implicitly)
+      toScroogeInternalOrderedSerialization[TestStruct]
+      runCompareTest[TestStruct](arbitraryInstanceProvider[TestStruct])
     }
 
     "Expected items should match : Internal Serializer / TestSets" in {
-      runCompareTest[TestSets](toScroogeInternalOrderedSerialization[TestSets], implicitly)
+      toScroogeInternalOrderedSerialization[TestSets]
+      runCompareTest[TestSets](arbitraryInstanceProvider[TestSets])
     }
 
     "Expected items should match : Internal Serializer / TestLists" in {
-      runCompareTest[TestLists](toScroogeInternalOrderedSerialization[TestLists], implicitly)
+      toScroogeInternalOrderedSerialization[TestLists]
+      runCompareTest[TestLists](arbitraryInstanceProvider[TestLists])
     }
 
     "Expected items should match : Internal Serializer /  TestMaps" in {
-      runCompareTest[TestMaps](toScroogeInternalOrderedSerialization[TestMaps], implicitly)
+      toScroogeInternalOrderedSerialization[TestMaps]
+      runCompareTest[TestMaps](arbitraryInstanceProvider[TestMaps])
     }
 
     "Expected items should match : Internal Serializer / TestUnion" in {
       toScroogeInternalOrderedSerialization[TestUnion]
-      runCompareTest[TestUnion](toScroogeInternalOrderedSerialization[TestUnion], arbitraryInstanceProvider[TestUnion])
+      runCompareTest[TestUnion](arbitraryInstanceProvider[TestUnion])
     }
 
     "Expected items should match : Internal Serializer / Enum" in {
-      runCompareTest[TestEnum](toScroogeInternalOrderedSerialization[TestEnum], implicitly)
+      toScroogeInternalOrderedSerialization[TestEnum]
+      runCompareTest[TestEnum](arbitraryInstanceProvider[TestEnum])
     }
 
     "Expected items should match : Internal Serializer / TestTypes" in {
-      runCompareTest[TestTypes](toScroogeInternalOrderedSerialization[TestTypes], implicitly)
+      toScroogeInternalOrderedSerialization[TestTypes]
+      runCompareTest[TestTypes](arbitraryInstanceProvider[TestTypes])
     }
 
     "Expected items should match : Internal Serializer / TestTypes2" in {
-      runCompareTest[TestTypes](toScroogeInternalOrderedSerialization[TestTypes], implicitly)
+      toScroogeInternalOrderedSerialization[TestTypes]
+      runCompareTest[TestTypes](arbitraryInstanceProvider[TestTypes])
     }
 
     "Expected items should match : Internal Serializer / (Long, TestTypes)" in {
@@ -107,7 +116,7 @@ class PlatformTest extends WordSpec with Matchers with HadoopSharedPlatformTest 
       }
 
       val ordSer = Container.ord[TestTypes]
-      runCompareTest[(Long, TestTypes)](ordSer, implicitly)
+      runCompareTest[(Long, TestTypes)](ordSer)
     }
 
   }

@@ -17,6 +17,7 @@
 package com.twitter.scalding.typed
 
 import java.io.Serializable
+import scala.reflect.ClassTag
 
 import com.twitter.algebird.Semigroup
 
@@ -82,7 +83,7 @@ object LookupJoin extends Serializable {
   def apply[T: Ordering, K: Ordering, V, JoinedV](
     left: TypedPipe[(T, (K, V))],
     right: TypedPipe[(T, (K, JoinedV))],
-    reducers: Option[Int] = None): TypedPipe[(T, (K, (V, Option[JoinedV])))] =
+    reducers: Option[Int] = None)(implicit mfT: ClassTag[T], mfK: ClassTag[K], mfV: ClassTag[V], mfJV: ClassTag[JoinedV]): TypedPipe[(T, (K, (V, Option[JoinedV])))] =
 
     withWindow(left, right, reducers)((_, _) => true)
 
@@ -92,7 +93,7 @@ object LookupJoin extends Serializable {
    */
   def rightSumming[T: Ordering, K: Ordering, V, JoinedV: Semigroup](left: TypedPipe[(T, (K, V))],
     right: TypedPipe[(T, (K, JoinedV))],
-    reducers: Option[Int] = None): TypedPipe[(T, (K, (V, Option[JoinedV])))] =
+    reducers: Option[Int] = None)(implicit mfT: ClassTag[T], mfK: ClassTag[K], mfV: ClassTag[V], mfJV: ClassTag[JoinedV]): TypedPipe[(T, (K, (V, Option[JoinedV])))] =
     withWindowRightSumming(left, right, reducers)((_, _) => true)
 
   /**
@@ -102,7 +103,7 @@ object LookupJoin extends Serializable {
    */
   def withWindow[T: Ordering, K: Ordering, V, JoinedV](left: TypedPipe[(T, (K, V))],
     right: TypedPipe[(T, (K, JoinedV))],
-    reducers: Option[Int] = None)(gate: (T, T) => Boolean): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
+    reducers: Option[Int] = None)(gate: (T, T) => Boolean)(implicit mfT: ClassTag[T], mfK: ClassTag[K], mfV: ClassTag[V], mfJV: ClassTag[JoinedV]): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
 
     implicit val keepNew: Semigroup[JoinedV] = Semigroup.from { (older, newer) => newer }
     withWindowRightSumming(left, right, reducers)(gate)
@@ -115,7 +116,7 @@ object LookupJoin extends Serializable {
    */
   def withWindowRightSumming[T: Ordering, K: Ordering, V, JoinedV: Semigroup](left: TypedPipe[(T, (K, V))],
     right: TypedPipe[(T, (K, JoinedV))],
-    reducers: Option[Int] = None)(gate: (T, T) => Boolean): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
+    reducers: Option[Int] = None)(gate: (T, T) => Boolean)(implicit mfT: ClassTag[T], mfK: ClassTag[K], mfV: ClassTag[V], mfJV: ClassTag[JoinedV]): TypedPipe[(T, (K, (V, Option[JoinedV])))] = {
     /**
      * Implicit ordering on an either that doesn't care about the
      * actual container values, puts the lookups before the service writes

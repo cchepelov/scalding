@@ -15,25 +15,30 @@ limitations under the License.
 */
 package com.twitter.scalding
 
+import java.lang.reflect.Type
+
 import cascading.tuple.Fields
 import cascading.pipe.Pipe
 import com.esotericsoftware.kryo.DefaultSerializer
 
 import java.util.Comparator
+import org.slf4j.{ Logger, LoggerFactory }
+
 import scala.annotation.tailrec
 import scala.collection.JavaConverters._
+import scala.reflect.ClassTag
 
 trait LowPriorityFieldConversions {
 
-  protected def anyToFieldArg(f: Any): Comparable[_] = f match {
-    case x: Symbol => x.name
-    case y: String => y
-    case z: java.lang.Integer => z
-    case v: Enumeration#Value => v.toString
-    case fld: Field[_] => fld.id
+  protected def anyToFieldArg(f: Any): (Comparable[_], Type) = f match {
+    case x: Symbol => (x.name, null)
+    case y: String => (y, null)
+    case z: java.lang.Integer => (z, null)
+    case v: Enumeration#Value => (v.toString, null)
+    case fld: Field[_] => (fld.id, fld.runtimeType.getOrElse(null))
     case flds: Fields => {
       if (flds.size == 1) {
-        flds.get(0)
+        (flds.get(0), flds.getType(0))
       } else {
         throw new Exception("Cannot convert Fields(" + flds.toString + ") to a single fields arg")
       }
@@ -50,10 +55,14 @@ trait LowPriorityFieldConversions {
    * higher priority.
    */
   implicit def productToFields(f: Product) = {
-    val fields = new Fields(f.productIterator.map { anyToFieldArg }.toSeq: _*)
+    val fields = FieldsMaker.make(f.productIterator.map { anyToFieldArg }.map(_._1).toArray,
+      f.productIterator.map { anyToFieldArg }.map(_._2).toArray)
+
     f.productIterator.foreach {
       _ match {
-        case field: Field[_] => fields.setComparator(field.id, field.ord)
+        case field: Field[_] => {
+          fields.setComparator(field.id, field.ord)
+        }
         case _ =>
       }
     }
@@ -71,7 +80,7 @@ trait FieldConversions extends LowPriorityFieldConversions {
   def asSet(f: Fields): Set[Comparable[_]] = asList(f).toSet
 
   // TODO get the comparator also
-  def getField(f: Fields, idx: Int): Fields = { new Fields(f.get(idx)) }
+  def getField(f: Fields, idx: Int): Fields = { FieldsMaker.make(f.get(idx), f.getType(idx)) }
 
   def hasInts(f: Fields): Boolean = f.iterator.asScala.exists { _.isInstanceOf[java.lang.Integer] }
 
@@ -185,7 +194,8 @@ trait FieldConversions extends LowPriorityFieldConversions {
    * exception before scheduling the job, I guess this is okay.
    */
   implicit def parseAnySeqToFields[T <: TraversableOnce[Any]](anyf: T) = {
-    val fields = new Fields(anyf.toSeq.map { anyToFieldArg }: _*)
+    val fields = { val args = anyf.toSeq.map { anyToFieldArg }.toArray; FieldsMaker.make(args.map(_._1), args.map(_._2)) }
+
     anyf.foreach {
       _ match {
         case field: Field[_] => fields.setComparator(field.id, field.ord)
@@ -202,8 +212,7 @@ trait FieldConversions extends LowPriorityFieldConversions {
     (f1, f2)
   }
   /**
-   * We can't set the field Manifests because cascading doesn't (yet) expose field type information
-   * in the Fields API.
+   * We attempt to recover the ClassTag fields from the Fields API
    */
   implicit def fieldsToRichFields(fields: Fields): RichFields = {
     if (!fields.isDefined) {
@@ -224,10 +233,15 @@ trait FieldConversions extends LowPriorityFieldConversions {
     // available "all at once" by calling getComparators.)
 
     new RichFields(asList(fields).zip(fields.getComparators).map {
-      case (id: Comparable[_], comparator: Comparator[_]) => id match {
-        case x: java.lang.Integer => IntField(x)(Ordering.comparatorToOrdering(comparator), None)
-        case y: String => StringField(y)(Ordering.comparatorToOrdering(comparator), None)
-        case z => sys.error("not expecting object of type " + z.getClass + " as field name")
+      case (id: Comparable[_], comparator: Comparator[_]) => {
+
+        val recoveredType = Option(fields.getType(id))
+
+        id match {
+          case x: java.lang.Integer => IntField(x, recoveredType)(Ordering.comparatorToOrdering(comparator), None)
+          case y: String => StringField(y, recoveredType)(Ordering.comparatorToOrdering(comparator), None)
+          case z => sys.error("not expecting object of type " + z.getClass + " as field name")
+        }
       }
     })
   }
@@ -240,36 +254,78 @@ trait FieldConversions extends LowPriorityFieldConversions {
 // val myFields: Fields = ...
 // myFields.toFieldList
 
-case class RichFields(val toFieldList: List[Field[_]]) extends Fields(toFieldList.map { _.id }: _*) {
+case class RichFields(val toFieldList: List[Field[_]])
+  extends Fields(toFieldList.map { _.id }.toArray,
+    FieldsMaker.convertTypeArray(toFieldList.map { _.id }.toArray,
+      toFieldList.map { _.runtimeType.getOrElse(null /* Fields says "nulls OK" */ ) }.toArray)) {
+
   toFieldList.foreach { field: Field[_] => setComparator(field.id, field.ord) }
 }
 
 object RichFields {
   def apply(f: Field[_]*) = new RichFields(f.toList)
   def apply(f: Traversable[Field[_]]) = new RichFields(f.toList)
-
 }
 
 sealed trait Field[T] extends java.io.Serializable {
   def id: Comparable[_]
   def ord: Ordering[T]
-  def mf: Option[Manifest[T]]
+  protected def mf: Option[ClassTag[T]]
+
+  def runtimeType: Option[Type] = mf.map(_.runtimeClass: Type)
 }
 
 @DefaultSerializer(classOf[serialization.IntFieldSerializer])
-case class IntField[T](override val id: java.lang.Integer)(implicit override val ord: Ordering[T], override val mf: Option[Manifest[T]]) extends Field[T]
+case class IntField[T](override val id: java.lang.Integer,
+  private val fallbackType: Option[Type] = None)(implicit override val ord: Ordering[T],
+    override val mf: Option[ClassTag[T]]) extends Field[T] {
+  override def runtimeType: Option[Type] = super.runtimeType.orElse(fallbackType)
+}
 
 @DefaultSerializer(classOf[serialization.StringFieldSerializer])
-case class StringField[T](override val id: String)(implicit override val ord: Ordering[T], override val mf: Option[Manifest[T]]) extends Field[T]
+case class StringField[T](override val id: String,
+  private val fallbackType: Option[Type] = None)(implicit override val ord: Ordering[T],
+    override val mf: Option[ClassTag[T]]) extends Field[T] {
+  override def runtimeType: Option[Type] = super.runtimeType.orElse(fallbackType)
+}
 
 object Field {
-  def apply[T](index: Int)(implicit ord: Ordering[T], mf: Manifest[T]) = IntField[T](index)(ord, Some(mf))
-  def apply[T](name: String)(implicit ord: Ordering[T], mf: Manifest[T]) = StringField[T](name)(ord, Some(mf))
-  def apply[T](symbol: Symbol)(implicit ord: Ordering[T], mf: Manifest[T]) = StringField[T](symbol.name)(ord, Some(mf))
+  def apply[T](index: Int)(implicit ord: Ordering[T], mf: ClassTag[T]) = IntField[T](index)(ord, Some(mf))
+  def apply[T](name: String)(implicit ord: Ordering[T], mf: ClassTag[T]) = StringField[T](name)(ord, Some(mf))
+  def apply[T](symbol: Symbol)(implicit ord: Ordering[T], mf: ClassTag[T]) = StringField[T](symbol.name)(ord, Some(mf))
 
-  def singleOrdered[T](name: String)(implicit ord: Ordering[T]): Fields = {
-    val f = new Fields(name)
+  def singleOrdered[T](name: String)(implicit ord: Ordering[T], mf: ClassTag[T]): Fields = {
+    val f = FieldsMaker.make(name, Option(mf).map(_.runtimeClass).getOrElse(null))
     f.setComparator(name, ord)
     f
   }
+}
+
+object FieldsMaker {
+  /* this wrapper around the Fields(names, types) constructor relaxes the Cascading constraint
+  that every field in a Fields has a type. Here we tolerate 'holes', but will protest in the logger. 
+   */
+
+  private val LOG: Logger = LoggerFactory.getLogger(this.getClass)
+
+  def make(name: Comparable[_], oftype: Type): Fields =
+    if (oftype != null) new Fields(name, oftype)
+    else new Fields(name)
+
+  private[scalding] def convertTypeArray(names: Array[Comparable[_]], oftypes: Array[Type]): Array[Type] = {
+    val nulltypes = oftypes.count(_ == null)
+
+    if (nulltypes == names.size) null /* consistently no types provided, OK */
+    else if (nulltypes == 0) oftypes /* types provided, OK */
+    else {
+      val readable = names.zip(oftypes).map(_ match {
+        case (n, t) => s"${n}: ${Option(t).map(_.toString).getOrElse("UNTYPED")}"
+      }).mkString(", ")
+
+      LOG.warn(s"Dropping incomplete but not empty type info in Fields(${readable})")
+      null
+    }
+  }
+
+  def make(names: Array[Comparable[_]], oftypes: Array[Type]): Fields = new Fields(names, convertTypeArray(names, oftypes))
 }

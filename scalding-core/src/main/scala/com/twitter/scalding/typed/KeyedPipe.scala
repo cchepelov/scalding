@@ -15,6 +15,8 @@ limitations under the License.
 */
 package com.twitter.scalding.typed
 
+import scala.reflect.ClassTag
+
 /**
  * Represents anything that starts as a TypedPipe of Key Value, where
  * the value type has been erased. Acts as proof that the K in the tuple
@@ -22,5 +24,6 @@ package com.twitter.scalding.typed
  */
 trait KeyedPipe[K] {
   def keyOrdering: Ordering[K]
+  def keyManifest: ClassTag[K]
   def mapped: TypedPipe[(K, Any)]
 }

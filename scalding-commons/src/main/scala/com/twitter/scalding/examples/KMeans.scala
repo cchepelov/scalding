@@ -1,5 +1,6 @@
 package com.twitter.scalding.examples
 
+import scala.reflect.ClassTag
 import com.twitter.scalding._
 import com.twitter.scalding.typed.ComputedValue
 
@@ -93,7 +94,7 @@ object KMeans {
     // take a random k vectors:
     val clusters = points.map { v => (rng.nextDouble, v) }
       .groupAll
-      .sortedTake(k)(Ordering.by(_._1))
+      .sortedTake(k)(Ordering.by(_._1), implicitly[ClassTag[(Double, Vector[Double])]])
       .mapValues { randk =>
         randk.iterator
           .zipWithIndex

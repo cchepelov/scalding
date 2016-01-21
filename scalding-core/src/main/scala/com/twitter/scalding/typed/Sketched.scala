@@ -19,6 +19,7 @@ import com.twitter.algebird.{ Bytes, CMS, CMSHasherImplicits }
 import com.twitter.scalding.serialization.macros.impl.BinaryOrdering._
 import com.twitter.scalding.serialization.{ OrderedSerialization, OrderedSerialization2 }
 
+import scala.reflect.ClassTag
 import scala.language.experimental.macros
 
 // This was a bad design choice, we should have just put these in the CMSHasher object
@@ -33,7 +34,7 @@ case class Sketched[K, V](pipe: TypedPipe[(K, V)],
   delta: Double,
   eps: Double,
   seed: Int)(implicit serialization: K => Array[Byte],
-    ordering: Ordering[K])
+    ordering: Ordering[K], mfK: ClassTag[K], mfV: ClassTag[V])
   extends MustHaveReducers {
 
   def serialize(k: K): Array[Byte] = serialization(k)
@@ -53,24 +54,24 @@ case class Sketched[K, V](pipe: TypedPipe[(K, V)],
    * Like a hashJoin, this joiner does not see all the values V at one time, only one at a time.
    * This is sufficient to implement join and leftJoin
    */
-  def cogroup[V2, R](right: TypedPipe[(K, V2)])(joiner: (K, V, Iterable[V2]) => Iterator[R]): SketchJoined[K, V, V2, R] =
+  def cogroup[V2, R](right: TypedPipe[(K, V2)])(joiner: (K, V, Iterable[V2]) => Iterator[R])(implicit mfR: ClassTag[R], mfV2: ClassTag[V2]): SketchJoined[K, V, V2, R] =
     new SketchJoined(this, right, numReducers)(joiner)
 
   /**
    * Does a logical inner join but replicates the heavy keys of the left hand side
    * across the reducers
    */
-  def join[V2](right: TypedPipe[(K, V2)]) = cogroup(right)(Joiner.hashInner2)
+  def join[V2](right: TypedPipe[(K, V2)])(implicit mfV2: ClassTag[V2]) = cogroup(right)(Joiner.hashInner2)
   /**
    * Does a logical left join but replicates the heavy keys of the left hand side
    * across the reducers
    */
-  def leftJoin[V2](right: TypedPipe[(K, V2)]) = cogroup(right)(Joiner.hashLeft2)
+  def leftJoin[V2](right: TypedPipe[(K, V2)])(implicit mfV2: ClassTag[V2]) = cogroup(right)(Joiner.hashLeft2)
 }
 
 case class SketchJoined[K: Ordering, V, V2, R](left: Sketched[K, V],
   right: TypedPipe[(K, V2)],
-  numReducers: Int)(joiner: (K, V, Iterable[V2]) => Iterator[R])
+  numReducers: Int)(joiner: (K, V, Iterable[V2]) => Iterator[R])(implicit mfK: ClassTag[K], mfV: ClassTag[V], mfV2: ClassTag[V2], mfR: ClassTag[R])
   extends MustHaveReducers {
 
   def reducers = Some(numReducers)
@@ -78,7 +79,7 @@ case class SketchJoined[K: Ordering, V, V2, R](left: Sketched[K, V],
   //the most of any one reducer we want to try to take up with a single key
   private val maxReducerFraction = 0.1
 
-  private def flatMapWithReplicas[W](pipe: TypedPipe[(K, W)])(fn: Int => Iterable[Int]) =
+  private def flatMapWithReplicas[W](pipe: TypedPipe[(K, W)])(fn: Int => Iterable[Int])(implicit mfW: ClassTag[W]) =
     pipe.cross(left.sketch).flatMap{
       case ((k, w), cms) =>
         val maxPerReducer = (cms.totalCount / numReducers) * maxReducerFraction + 1

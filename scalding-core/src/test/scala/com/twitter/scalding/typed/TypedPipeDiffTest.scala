@@ -136,7 +136,7 @@ object TypedPipeDiffLaws {
     checkDiff(left.map(_.toSeq), right.map(_.toSeq), diff)
   }
 
-  def diffLaw[T: Ordering: Arbitrary]: Prop = Prop.forAll { (left: List[T], right: List[T]) =>
+  def diffLaw[T: Ordering: Arbitrary](implicit mf: ClassTag[T]): Prop = Prop.forAll { (left: List[T], right: List[T]) =>
     val diff = runToList(TypedPipe.from(left).diff(TypedPipe.from(right)).toTypedPipe)
     checkDiff(left, right, diff)
   }
@@ -147,7 +147,7 @@ object TypedPipeDiffLaws {
     checkArrayDiff(left, right, diff)
   }
 
-  def diffByGroupLaw[T: Arbitrary]: Prop = Prop.forAll { (left: List[T], right: List[T]) =>
+  def diffByGroupLaw[T: Arbitrary](implicit mf: ClassTag[T]): Prop = Prop.forAll { (left: List[T], right: List[T]) =>
     val diff = runToList(TypedPipe.from(left).diffByHashCode(TypedPipe.from(right)))
     checkDiff(left, right, diff)
   }

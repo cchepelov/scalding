@@ -24,6 +24,7 @@ import com.twitter.scalding._
 
 import scala.annotation.meta.param
 import scala.collection.JavaConverters._
+import scala.reflect.ClassTag
 
 import com.twitter.scalding.serialization.Externalizer
 import com.twitter.scalding.TupleConverter.tuple2Converter
@@ -68,6 +69,9 @@ trait CoGroupable[K, +R] extends HasReducers with HasDescription with java.io.Se
 
   def keyOrdering: Ordering[K]
 
+  def keyManifest: ClassTag[K]
+  def valueManifest: ClassTag[_ <: R]
+
   /**
    * This function is not type-safe for others to call, but it should
    * never have an error. By construction, we never call it with incorrect
@@ -87,16 +91,22 @@ trait CoGroupable[K, +R] extends HasReducers with HasDescription with java.io.Se
    * fewer values per key on the right. If both sides are similar, no need to worry.
    * If one side is a one-to-one mapping, that should be the "smaller" side.
    */
-  def cogroup[R1, R2](smaller: CoGroupable[K, R1])(fn: (K, Iterator[R], Iterable[R1]) => Iterator[R2]): CoGrouped[K, R2] = {
+  def cogroup[R1, R2](smaller: CoGroupable[K, R1])(fn: (K, Iterator[R], Iterable[R1]) => Iterator[R2])(implicit mfK: ClassTag[K], mfR2: ClassTag[R2]): CoGrouped[K, R2] = {
     val self = this
     val leftSeqCount = self.inputs.size - 1
     val jf = joinFunction // avoid capturing `this` in the closure below
     val smallerJf = smaller.joinFunction
+    implicit val mfKR2 = implicitly[ClassTag[(K, R2)]]
 
     new CoGrouped[K, R2] {
       val inputs = self.inputs ++ smaller.inputs
       val reducers = (self.reducers.toIterable ++ smaller.reducers.toIterable).reduceOption(_ max _)
       val descriptions: Seq[String] = self.descriptions ++ smaller.descriptions
+
+      def keyManifest: ClassTag[K] = mfK
+      def valueManifest: ClassTag[_ <: R2] = mfR2
+      def keyValueManifest: ClassTag[_ <: (K, R2)] = mfKR2
+
       def keyOrdering = smaller.keyOrdering
 
       /**
@@ -123,39 +133,70 @@ trait CoGroupable[K, +R] extends HasReducers with HasDescription with java.io.Se
     }
   }
 
-  def join[W](smaller: CoGroupable[K, W]) =
+  def join[W](smaller: CoGroupable[K, W])(implicit mfW: ClassTag[W]) = {
+    implicit val mfK = keyManifest
+    implicit val mfR = valueManifest.asInstanceOf[ClassTag[R]]
     cogroup[W, (R, W)](smaller)(Joiner.inner2)
-  def leftJoin[W](smaller: CoGroupable[K, W]) =
+  }
+
+  def leftJoin[W](smaller: CoGroupable[K, W])(implicit mfW: ClassTag[W]) = {
+    implicit val mfK = keyManifest
+    implicit val mfR = valueManifest.asInstanceOf[ClassTag[R]]
     cogroup[W, (R, Option[W])](smaller)(Joiner.left2)
-  def rightJoin[W](smaller: CoGroupable[K, W]) =
+  }
+
+  def rightJoin[W](smaller: CoGroupable[K, W])(implicit mfW: ClassTag[W]) = {
+    implicit val mfK = keyManifest
+    implicit val mfR = valueManifest.asInstanceOf[ClassTag[R]]
     cogroup[W, (Option[R], W)](smaller)(Joiner.right2)
-  def outerJoin[W](smaller: CoGroupable[K, W]) =
+  }
+
+  def outerJoin[W](smaller: CoGroupable[K, W])(implicit mfW: ClassTag[W]) = {
+    implicit val mfK = keyManifest
+    implicit val mfR = valueManifest.asInstanceOf[ClassTag[R]]
     cogroup[W, (Option[R], Option[W])](smaller)(Joiner.outer2)
+  }
   // TODO: implement blockJoin
 }
 
 trait CoGrouped[K, +R] extends KeyedListLike[K, R, CoGrouped] with CoGroupable[K, R] with WithReducers[CoGrouped[K, R]] with WithDescription[CoGrouped[K, R]] {
+  implicit def keyValueManifest: ClassTag[_ <: (K, R)]
+
   override def withReducers(reds: Int) = {
     val self = this // the usual self => trick leads to serialization errors
     val joinF = joinFunction // can't access this on self, since it is protected
+    val mfR: ClassTag[R] = valueManifest.asInstanceOf[ClassTag[R]]
+    val mfK: ClassTag[K] = keyManifest
+    val mfKR: ClassTag[(K, R)] = keyValueManifest.asInstanceOf[ClassTag[(K, R)]]
+
     new CoGrouped[K, R] {
       def inputs = self.inputs
       def reducers = Some(reds)
       def keyOrdering = self.keyOrdering
       def joinFunction = joinF
       def descriptions: Seq[String] = self.descriptions
+      def keyManifest: ClassTag[K] = mfK
+      def valueManifest: ClassTag[_ <: R] = mfR
+      def keyValueManifest: ClassTag[_ <: (K, R)] = mfKR
     }
   }
 
   override def withDescription(description: String) = {
     val self = this // the usual self => trick leads to serialization errors
     val joinF = joinFunction // can't access this on self, since it is protected
+    val mfR: ClassTag[R] = valueManifest.asInstanceOf[ClassTag[R]]
+    val mfK: ClassTag[K] = keyManifest
+    val mfKR: ClassTag[(K, R)] = keyValueManifest.asInstanceOf[ClassTag[(K, R)]]
+
     new CoGrouped[K, R] {
       def inputs = self.inputs
       def reducers = self.reducers
       def keyOrdering = self.keyOrdering
       def joinFunction = joinF
       def descriptions: Seq[String] = self.descriptions :+ description
+      def keyManifest: ClassTag[K] = mfK
+      def valueManifest: ClassTag[_ <: R] = mfR
+      def keyValueManifest: ClassTag[_ <: (K, R)] = mfKR
     }
   }
 
@@ -172,23 +213,37 @@ trait CoGrouped[K, +R] extends KeyedListLike[K, R, CoGrouped] with CoGroupable[K
   override def filterKeys(fn: K => Boolean): CoGrouped[K, R] = {
     val self = this // the usual self => trick leads to serialization errors
     val joinF = joinFunction // can't access this on self, since it is protected
+    val mfR: ClassTag[R] = valueManifest.asInstanceOf[ClassTag[R]]
+    val mfK: ClassTag[K] = keyManifest
+    val mfKR: ClassTag[(K, R)] = keyValueManifest.asInstanceOf[ClassTag[(K, R)]]
+
     new CoGrouped[K, R] {
       val inputs = self.inputs.map(_.filterKeys(fn))
       def reducers = self.reducers
       def descriptions: Seq[String] = self.descriptions
       def keyOrdering = self.keyOrdering
       def joinFunction = joinF
+      def keyManifest: ClassTag[K] = mfK
+      def valueManifest: ClassTag[_ <: R] = mfR
+      def keyValueManifest: ClassTag[_ <: (K, R)] = mfKR
     }
   }
 
-  override def mapGroup[R1](fn: (K, Iterator[R]) => Iterator[R1]): CoGrouped[K, R1] = {
+  override def mapGroup[R1](fn: (K, Iterator[R]) => Iterator[R1])(implicit mfR1: ClassTag[R1]): CoGrouped[K, R1] = {
     val self = this // the usual self => trick leads to serialization errors
     val joinF = joinFunction // can't access this on self, since it is protected
+    val mfK: ClassTag[K] = keyManifest
+    val mfKR1: ClassTag[(K, R1)] = keyValueManifest.asInstanceOf[ClassTag[(K, R1)]]
+
     new CoGrouped[K, R1] {
       def inputs = self.inputs
       def reducers = self.reducers
       def descriptions: Seq[String] = self.descriptions
       def keyOrdering = self.keyOrdering
+      def keyManifest: ClassTag[K] = mfK
+      def valueManifest: ClassTag[_ <: R1] = mfR1
+      def keyValueManifest: ClassTag[_ <: (K, R1)] = mfKR1
+
       def joinFunction = { (k: K, leftMost: Iterator[CTuple], joins: Seq[Iterable[CTuple]]) =>
         val joined = joinF(k, leftMost, joins)
         /*
@@ -220,6 +275,7 @@ trait CoGrouped[K, +R] extends KeyedListLike[K, R, CoGrouped] with CoGroupable[K
 
     // Make this stable so the compiler does not make a closure
     val ord = keyOrdering
+    implicit val mf = keyManifest
 
     TypedPipeFactory({ (flowDef, mode) =>
       val newPipe = Grouped.maybeBox[K, Any](ord, flowDef) { (tupset, ordKeyField) =>
@@ -307,9 +363,11 @@ trait CoGrouped[K, +R] extends KeyedListLike[K, R, CoGrouped] with CoGroupable[K
         RichPipe.setPipeDescriptions(newPipe, descriptions)
         newPipe.project('key, 'value)
       }
+
       //Construct the new TypedPipe
-      TypedPipe.from[(K, R)](pipeWithRedAndDescriptions, ('key, 'value))(flowDef, mode, tuple2Converter)
-    })
+      TypedPipe.from[(K, R)](pipeWithRedAndDescriptions, ('key, 'value))(flowDef, mode, tuple2Converter,
+        keyValueManifest.asInstanceOf[ClassTag[(K, R)]])
+    })(keyValueManifest.asInstanceOf[ClassTag[(K, R)]])
   }
 }
 

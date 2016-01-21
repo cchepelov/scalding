@@ -155,13 +155,13 @@ class MultipleGroupByJob(args: Args) extends Job(args) {
 
   TypedPipe.from(data)
     .map{ k => (k, 1L) }
-    .group[String, Long](implicitly, stringOrdSer)
+    .group[String, Long]
     .sum
     .map {
       case (k, _) =>
         ((k, k), 1L)
     }
-    .sumByKey[(String, String), Long](implicitly, stringTup2OrdSer, implicitly)
+    .sumByKey[(String, String), Long]
     .map(_._1._1)
     .map { t =>
       (t.toString, t)

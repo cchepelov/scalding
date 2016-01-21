@@ -16,6 +16,8 @@ limitations under the License.
 package com.twitter.scalding.platform
 
 import scala.collection.JavaConverters._
+import scala.reflect.ClassTag
+
 import cascading.flow.Flow
 import com.twitter.scalding._
 import com.twitter.scalding.source.TypedText
@@ -45,9 +47,9 @@ case class HadoopPlatformJobTest(
 
   def arg(inArg: String, value: String): HadoopPlatformJobTest = arg(inArg, List(value))
 
-  def source[T: TypeDescriptor](location: String, data: Seq[T]): HadoopPlatformJobTest = source(TypedText.tsv[T](location), data)
+  def source[T: TypeDescriptor](location: String, data: Seq[T])(implicit mfT: ClassTag[T]): HadoopPlatformJobTest = source(TypedText.tsv[T](location), data)
 
-  def source[T](out: TypedSink[T], data: Seq[T]): HadoopPlatformJobTest =
+  def source[T](out: TypedSink[T], data: Seq[T])(implicit mfT: ClassTag[T]): HadoopPlatformJobTest =
     copy(sourceWriters = sourceWriters :+ { args: Args =>
       new Job(args) {
         TypedPipe.from(List("")).flatMap { _ => data }.write(out)
